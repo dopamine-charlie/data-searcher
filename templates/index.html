@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Data Searcher</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="app">
+    <header class="header">
+      <h1>Data Searcher</h1>
+      <p class="tagline">Enrich Name, City, State with address, phone & email from Google search</p>
+    </header>
+
+    <main class="main">
+      <section class="upload-section" id="uploadSection">
+        <div class="dropzone" id="dropzone">
+          <input type="file" id="fileInput" accept=".csv" hidden>
+          <div class="dropzone-content">
+            <svg class="upload-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+              <polyline points="17 8 12 3 7 8"/>
+              <line x1="12" y1="3" x2="12" y2="15"/>
+            </svg>
+            <p><strong>Drop your CSV here</strong> or click to browse</p>
+            <p class="hint">Columns: Name, City, State (or First Name, Last Name, City, State)</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="config-section hidden" id="configSection">
+        <h2>Map columns</h2>
+        <p class="row-count" id="rowCount"></p>
+        <div class="column-mapping">
+          <div class="field">
+            <label>Name format</label>
+            <div class="radio-group">
+              <label class="radio-option">
+                <input type="radio" name="nameMode" value="full" id="nameModeFull">
+                <span>Full Name (1 column)</span>
+              </label>
+              <label class="radio-option">
+                <input type="radio" name="nameMode" value="firstLast" id="nameModeFirstLast">
+                <span>First Name + Last Name (2 columns)</span>
+              </label>
+            </div>
+          </div>
+          <div class="field name-full" id="nameFullField">
+            <label for="nameCol">Full Name column</label>
+            <select id="nameCol"></select>
+          </div>
+          <div class="field name-first-last hidden" id="nameFirstLastField">
+            <label for="firstNameCol">First Name column</label>
+            <select id="firstNameCol"></select>
+          </div>
+          <div class="field name-first-last hidden" id="lastNameField">
+            <label for="lastNameCol">Last Name column</label>
+            <select id="lastNameCol"></select>
+          </div>
+          <div class="field">
+            <label for="cityCol">City column</label>
+            <select id="cityCol"></select>
+          </div>
+          <div class="field">
+            <label for="stateCol">State column</label>
+            <select id="stateCol"></select>
+          </div>
+          <div class="field">
+            <label for="enrichMode">Enrichment mode</label>
+            <select id="enrichMode">
+              <option value="duck_then_serper" selected>DuckDuckGo + Serper fallback (recommended)</option>
+              <option value="serper_only">Serper only (uses API quota for all rows)</option>
+              <option value="duck_only">DuckDuckGo only (no Serper)</option>
+            </select>
+            <span class="hint">Serper fallback runs when DuckDuckGo returns no real data.</span>
+          </div>
+          <div class="field">
+            <label for="limit">Max rows to enrich</label>
+            <select id="limit">
+              <option value="5">5 (quick test)</option>
+              <option value="10">10</option>
+              <option value="25">25</option>
+              <option value="50">50</option>
+              <option value="100">100</option>
+              <option value="250">250</option>
+              <option value="500">500</option>
+              <option value="1000">1000</option>
+              <option value="all" selected>All rows</option>
+            </select>
+            <span class="hint">~1 second per row. Large runs may take several minutes.</span>
+          </div>
+        </div>
+        <div class="actions">
+          <button type="button" class="btn btn-secondary" id="changeFile">Change file</button>
+          <button type="button" class="btn btn-primary" id="enrichBtn">
+            <span class="btn-text">Enrich contacts</span>
+            <span class="btn-loading hidden">Enriching…</span>
+          </button>
+        </div>
+      </section>
+
+      <section class="progress-section hidden" id="progressSection">
+        <div class="progress-card">
+          <div class="spinner"></div>
+          <p class="progress-status" id="progressStatus">Starting…</p>
+          <div class="progress-bar-wrap">
+            <div class="progress-bar" id="progressBar"></div>
+          </div>
+          <p class="progress-detail" id="progressDetail">0 / 0 rows</p>
+        </div>
+      </section>
+
+      <section class="result-section hidden" id="resultSection">
+        <div class="result-card">
+          <div class="result-icon">✓</div>
+          <h2>Enrichment complete</h2>
+          <p class="result-stats" id="resultStats"></p>
+          <div class="actions">
+            <button type="button" class="btn btn-secondary" id="enrichAnother">Enrich another file</button>
+            <a class="btn btn-primary" id="downloadBtn" download="enriched.csv">Download CSV</a>
+          </div>
+        </div>
+      </section>
+
+      <section class="error-section hidden" id="errorSection">
+        <div class="error-card">
+          <p class="error-message" id="errorMessage"></p>
+          <button type="button" class="btn btn-secondary" id="dismissError">OK</button>
+        </div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <p>Stage 1: <a href="https://duckduckgo.com" target="_blank" rel="noopener">DuckDuckGo</a> (free) • Stage 2: <a href="https://serper.dev" target="_blank" rel="noopener">Serper</a> (2,500 free/month)</p>
+    </footer>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

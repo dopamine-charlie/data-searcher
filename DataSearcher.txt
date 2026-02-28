@@ -1,0 +1,224 @@
+/**
+ * Data Searcher - Google Apps Script
+ * Enriches Name, City, State with address, phone, email from Google search.
+ *
+ * HOW TO RUN:
+ * 1. Make sure your sheet has columns: Name, City, State (row 1 = headers)
+ * 2. In Apps Script: select "runEnrichment" from the dropdown at the top
+ * 3. Click the Run button (play icon)
+ * 4. Approve permissions if asked (first time only)
+ * 5. Wait - a popup will say when it's done
+ * 6. Go to your sheet - new columns (Address, Zip, Phone, Email) will be there
+ *
+ * IMPORTANT: The script must be opened from YOUR sheet (Extensions → Apps Script).
+ * It enriches the sheet it's attached to.
+ */
+
+const SERPER_API_KEY = 'e583a6c40bb488d50a19f1f902be2ba0031a4845';
+
+/**
+ * RUN THIS - Select "runEnrichment" from dropdown, click Run.
+ */
+function runEnrichment() {
+  enrichRows(false);
+}
+
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('Data Searcher')
+    .addItem('Enrich All Rows', 'enrichAllRows')
+    .addItem('Enrich Selected Rows', 'enrichSelectedRows')
+    .addToUi();
+}
+
+function enrichSelectedRows() {
+  enrichRows(true);
+}
+
+function enrichAllRows() {
+  enrichRows(false);
+}
+
+function enrichRows(selectedOnly) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getActiveSheet();
+  const sheetName = sheet.getName();
+
+  const data = sheet.getDataRange().getValues();
+  if (data.length < 2) {
+    SpreadsheetApp.getUi().alert('Need at least a header row and one data row. Your sheet "' + sheetName + '" has ' + data.length + ' rows.');
+    return;
+  }
+
+  const headers = data[0];
+  const firstNameCol = findCol(headers, ['first name', 'firstname']);
+  const lastNameCol = findCol(headers, ['last name', 'lastname']);
+  const nameCol = findCol(headers, ['name', 'full name']);
+  const cityCol = findCol(headers, ['city']);
+  const stateCol = findCol(headers, ['state']);
+
+  let nameColFinal = nameCol;
+  if (nameCol < 0 && firstNameCol >= 0) {
+    nameColFinal = firstNameCol;
+  }
+
+  if (nameColFinal < 0 || cityCol < 0 || stateCol < 0) {
+    SpreadsheetApp.getUi().alert('Could not find Name (or First Name + Last Name), City, State columns.');
+    return;
+  }
+
+  const outputStartCol = Math.max(nameColFinal, lastNameCol >= 0 ? lastNameCol : nameColFinal, cityCol, stateCol) + 1;
+  const outputHeaders = ['Address', 'City_Enriched', 'State_Enriched', 'Zip', 'Phone', 'Email'];
+  const numOutputCols = outputHeaders.length;
+
+  // Write output headers if not already there
+  const existingOutput = sheet.getRange(1, outputStartCol, 1, outputStartCol + numOutputCols - 1).getValues()[0];
+  if (!existingOutput[0] || existingOutput[0] !== outputHeaders[0]) {
+    sheet.getRange(1, outputStartCol, 1, outputStartCol + numOutputCols - 1).setValues([outputHeaders]);
+  }
+
+  let startRow = 1;
+  let endRow = data.length - 1;
+
+  if (selectedOnly) {
+    const selection = sheet.getActiveRange();
+    if (!selection) {
+      SpreadsheetApp.getUi().alert('Select the data rows you want to enrich first.');
+      return;
+    }
+    startRow = selection.getRow();
+    endRow = selection.getLastRow();
+    if (startRow === 1) startRow = 2; // skip header
+  } else {
+    startRow = 2; // skip header
+  }
+
+  const total = endRow - startRow + 1;
+  SpreadsheetApp.getUi().alert('Enriching ' + total + ' rows. This may take a few minutes. Click OK to start.');
+
+  let enriched = 0;
+  for (let r = startRow; r <= endRow; r++) {
+    const row = data[r - 1];
+    let name = String(row[nameColFinal] || '').trim();
+    if (firstNameCol >= 0 && lastNameCol >= 0) {
+      const first = String(row[firstNameCol] || '').trim();
+      const last = String(row[lastNameCol] || '').trim();
+      name = (first + ' ' + last).trim() || name;
+    }
+    const city = String(row[cityCol] || '').trim();
+    const state = String(row[stateCol] || '').trim();
+
+    const parts = [name, city, state].filter(p => p);
+    const query = parts.join(', ') + ' address phone email';
+
+    let result = ['', city, state, '', '', ''];
+
+    if (query !== ' address phone email') {
+      try {
+        const extracted = searchAndExtract(query);
+        result = [
+          extracted.addresses[0] || '',
+          city || '',
+          state || '',
+          extracted.zip || '',
+          extracted.phones[0] || '',
+          extracted.emails[0] || ''
+        ];
+        if (result[0] || result[3] || result[4] || result[5]) enriched++;
+      } catch (e) {
+        console.error('Row ' + r + ': ' + e.message);
+      }
+    }
+
+    sheet.getRange(r, outputStartCol, r, outputStartCol + numOutputCols - 1).setValues([result]);
+    SpreadsheetApp.flush();
+
+    if (r < endRow) {
+      Utilities.sleep(1000); // 1 sec delay between API calls
+    }
+  }
+
+  SpreadsheetApp.getUi().alert('Done! Enriched ' + enriched + ' of ' + total + ' rows.');
+}
+
+function findCol(headers, names) {
+  for (let i = 0; i < headers.length; i++) {
+    const h = String(headers[i] || '').toLowerCase();
+    for (const n of names) {
+      if (h.includes(n)) return i;
+    }
+  }
+  return -1;
+}
+
+function searchAndExtract(query) {
+  const url = 'https://google.serper.dev/search';
+  const options = {
+    method: 'post',
+    contentType: 'application/json',
+    headers: { 'X-API-KEY': SERPER_API_KEY },
+    payload: JSON.stringify({ q: query, num: 10 }),
+    muteHttpExceptions: true
+  };
+
+  const resp = UrlFetchApp.fetch(url, options);
+  if (resp.getResponseCode() !== 200) {
+    throw new Error('Serper API error: ' + resp.getContentText());
+  }
+
+  const data = JSON.parse(resp.getContentText());
+  const text = collectText(data);
+  return {
+    phones: extractPhones(text),
+    emails: extractEmails(text),
+    addresses: extractAddresses(text),
+    zip: extractZip(text)
+  };
+}
+
+function collectText(data) {
+  const parts = [];
+  const kg = data.knowledgeGraph || {};
+  if (kg.description) parts.push(kg.description);
+  if (kg.attributes) {
+    Object.values(kg.attributes).forEach(v => parts.push(String(v)));
+  }
+  (data.organic || []).forEach(o => {
+    if (o.snippet) parts.push(o.snippet);
+    if (o.title) parts.push(o.title);
+  });
+  (data.peopleAlsoAsk || []).forEach(p => {
+    if (p.snippet) parts.push(p.snippet);
+  });
+  return parts.join(' ');
+}
+
+function extractPhones(text) {
+  const re = /(?:\+1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}|(?:\d{3}[-.\s]){2}\d{4}/g;
+  const m = text.match(re) || [];
+  return [...new Set(m)];
+}
+
+function extractEmails(text) {
+  const re = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
+  const m = text.match(re) || [];
+  return [...new Set(m)];
+}
+
+function extractAddresses(text) {
+  const found = [];
+  const fullRe = /\d+\s+[A-Za-z0-9\s.\-]+(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Drive|Dr|Lane|Ln|Court|Ct|Way|Place|Pl|Circle|Cir)[,.\s]+[A-Za-z\s]+,\s*[A-Z]{2}\s+\d{5}(?:-\d{4})?/gi;
+  let m;
+  while ((m = fullRe.exec(text)) !== null) found.push(m[0].trim());
+  const streetRe = /(\d+\s+[A-Za-z0-9\s.\-]+(?:St|Ave|Rd|Blvd|Dr|Ln|Ct)\.?)\s*[,]?\s*([A-Za-z\s]+),\s*([A-Z]{2})\s+(\d{5}(?:-\d{4})?)/gi;
+  while ((m = streetRe.exec(text)) !== null) {
+    const addr = m[1].trim() + ', ' + m[2].trim() + ', ' + m[3] + ' ' + m[4];
+    if (!found.includes(addr)) found.push(addr);
+  }
+  return [...new Set(found)];
+}
+
+function extractZip(text) {
+  const m = text.match(/[A-Za-z\s]+,\s*[A-Z]{2}\s+(\d{5}(?:-\d{4})?)/i);
+  return m ? m[1] : null;
+}
