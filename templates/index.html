@@ -70,13 +70,9 @@
             <select id="stateCol"></select>
           </div>
           <div class="field">
-            <label for="enrichMode">Enrichment mode</label>
-            <select id="enrichMode">
-              <option value="duck_then_serper" selected>DuckDuckGo + Serper fallback (recommended)</option>
-              <option value="serper_only">Serper only (uses API quota for all rows)</option>
-              <option value="duck_only">DuckDuckGo only (no Serper)</option>
-            </select>
-            <span class="hint">Serper fallback runs when DuckDuckGo returns no real data.</span>
+            <label>Enrichment source</label>
+            <input type="text" value="Serper (API)" disabled />
+            <span class="hint">This app now runs Serper-only for faster, more consistent enrichment.</span>
           </div>
           <div class="field">
             <label for="limit">Max rows to enrich</label>
@@ -91,7 +87,7 @@
               <option value="1000">1000</option>
               <option value="all" selected>All rows</option>
             </select>
-            <span class="hint">~1 second per row. Large runs may take several minutes.</span>
+            <span class="hint">Typical speed is a few rows per second, depending on API/network conditions.</span>
           </div>
         </div>
         <div class="actions">
@@ -135,7 +131,7 @@
     </main>
 
     <footer class="footer">
-      <p>Stage 1: <a href="https://duckduckgo.com" target="_blank" rel="noopener">DuckDuckGo</a> (free) • Stage 2: <a href="https://serper.dev" target="_blank" rel="noopener">Serper</a> (2,500 free/month)</p>
+      <p>Enrichment powered by <a href="https://serper.dev" target="_blank" rel="noopener">Serper</a> (2,500 free/month on starter plan).</p>
     </footer>
   </div>
 

@@ -1,6 +1,6 @@
 """
 Data Searcher - Enrich Name, City, State with address, phone, email.
-Stage 1: DuckDuckGo (free). Stage 2: Serper (2,500 free/month).
+Serper-powered enrichment with address, phone, email extraction.
 """
 
 import csv
@@ -10,10 +10,8 @@ import re
 import threading
 import time
 import uuid
-from urllib.parse import quote_plus
 
 import requests
-from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from flask import Flask, jsonify, render_template, request
 
@@ -23,47 +21,29 @@ app = Flask(__name__)
 
 SERPER_ENDPOINT = os.getenv("SERPER_ENDPOINT", "https://google.serper.dev/search")
 SERPER_API_KEY = os.getenv("SERPER_API_KEY")
-REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "1.0"))
-DUCK_DELAY = float(os.getenv("DUCK_DELAY", "1.5"))  # Slightly longer for free scraping
-MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5"))
+# Faster defaults to keep batch runs practical; env vars can override.
+REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "0.35"))
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
+SERPER_NUM_RESULTS = int(os.getenv("SERPER_NUM_RESULTS", "10"))
+SERPER_CONTACT_NUM_RESULTS = int(os.getenv("SERPER_CONTACT_NUM_RESULTS", "6"))
+SERPER_ADDRESS_FALLBACK_NUM_RESULTS = int(os.getenv("SERPER_ADDRESS_FALLBACK_NUM_RESULTS", "8"))
 
 OUTPUT_HEADERS = ["Address", "Phone", "Email", "Website", "Source_URL"]
-
-# DuckDuckGo garbage we treat as "no result" so Serper gets a chance
-DUCK_GARBAGE_EMAILS = {"error-lite@duckduckgo.com"}
-DUCK_REDIRECT_PREFIX = "duckduckgo.com/l/?uddg="
+US_STATE_CODES = {
+    "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA",
+    "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD",
+    "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ",
+    "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC",
+    "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY",
+    "DC",
+}
 
 # In-memory job store (single-user local app)
 jobs: dict = {}
 jobs_lock = threading.Lock()
 
 
-def is_duck_garbage(result: dict) -> bool:
-    """Return True if DuckDuckGo returned placeholder/garbage (e.g. error-lite@duckduckgo.com)."""
-    email = (result.get("email") or "").lower().strip()
-    if email and ("duckduckgo.com" in email or email in DUCK_GARBAGE_EMAILS):
-        return True
-    src = (result.get("source_url") or "").lower()
-    if DUCK_REDIRECT_PREFIX in src:
-        return True
-    return False
-
-
-def clear_duck_garbage(result: dict) -> dict:
-    """Treat DuckDuckGo garbage as empty so Serper fallback triggers."""
-    if not is_duck_garbage(result):
-        return result
-    return {
-        **result,
-        "address": "",
-        "phone": "",
-        "email": "",
-        "website": "",
-        "source_url": "",
-    }
-
-
-# --- Extraction (shared by DuckDuckGo and Serper) ---
+# --- Extraction helpers ---
 
 def extract_phones(text: str) -> list[str]:
     if not text:
@@ -93,25 +73,275 @@ def extract_emails(text: str) -> list[str]:
     return out
 
 
+def build_address_query(name: str, city: str, state: str) -> str:
+    """Build an address-first query string while handling missing fields safely."""
+    base = " ".join(part for part in [name.strip(), city.strip(), state.strip()] if part)
+    return f"{base} full street address zip code".strip()
+
+
+def build_contact_query(name: str, city: str, state: str) -> str:
+    """Build a contact-focused query used only as bounded fallback."""
+    base = " ".join(part for part in [name.strip(), city.strip(), state.strip()] if part)
+    return f"{base} phone email contact".strip()
+
+
+def build_address_fallback_query(name: str, city: str, state: str) -> str:
+    """Build a second address-focused query for missing-address fallback."""
+    base = " ".join(part for part in [name.strip(), city.strip(), state.strip()] if part)
+    return f"\"{name.strip()}\" {base} current home address".strip()
+
+
+def has_zip(addr: str) -> bool:
+    return bool(re.search(r"\b\d{5}(?:-\d{4})?\b", addr or ""))
+
+
+def has_state_code(addr: str) -> bool:
+    return bool(re.search(r"\b[A-Z]{2}\b", (addr or "").upper()))
+
+
+def has_street(addr: str) -> bool:
+    return bool(
+        re.search(
+            r"\b\d{1,6}\s+[A-Za-z0-9#.\- ]{2,45}(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Drive|Dr|Lane|Ln|Court|Ct|Way|Place|Pl|Circle|Cir|Highway|Hwy|Trail|Trl|Parkway|Pkwy|Terrace|Ter|Loop|Lp|Str)\b",
+            (addr or ""),
+            re.I,
+        )
+    )
+
+
+def _trim_to_street_start(addr: str) -> str:
+    """Trim noisy leading text and keep the most address-like street segment."""
+    if not addr:
+        return ""
+    s = _normalize_address_spaces(addr)
+    s = re.sub(
+        r"^.*?\b(?:address is|located at|living at|present address is|address\.?)\b[:\s-]*",
+        "",
+        s,
+        flags=re.I,
+    )
+    street_pat = (
+        r"\b\d{1,6}\s+[A-Za-z0-9#.\- ]{2,45}"
+        r"(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Drive|Dr|Lane|Ln|Court|Ct|Way|Place|Pl|Circle|Cir|Highway|Hwy|Trail|Trl|Parkway|Pkwy|Terrace|Ter|Loop|Lp|Str)\b"
+    )
+    # Lookahead allows overlapping starts; this helps recover the inner clean address.
+    starts = [m.start(1) for m in re.finditer(rf"(?=({street_pat}))", s, re.I)]
+    if starts:
+        s = s[starts[-1] :]
+
+    # Remove common leading numeric noise fragments.
+    s = re.sub(r"^\d{1,4}\s*\.\.\.\s*", "", s)
+    s = re.sub(r"^\d{1,4}\s+(?:sqft|baths|people|family|individuals|different|rentable|mi)\b[^0-9]{0,80}", "", s, flags=re.I)
+    return _normalize_address_spaces(s)
+
+
+def _normalize_address_spaces(addr: str) -> str:
+    addr = re.sub(r"\s+", " ", addr or "").strip(" ,.;")
+    # Fix common scraping split like "St, reet" -> "Street".
+    addr = re.sub(r"\b(St|st),\s*reet\b", "Street", addr)
+    addr = re.sub(r"\b(Dr|dr),\s*ive\b", "Drive", addr)
+    addr = re.sub(r"\b(Blvd|blvd),\s*oulevard\b", "Boulevard", addr)
+    return addr
+
+
+def _format_address_output(addr: str) -> str:
+    """Normalize output to Street, City, ST, ZIP (comma before ZIP)."""
+    s = _normalize_address_spaces(addr)
+    if not s:
+        return ""
+    state_zip = r"([A-Za-z]{2})\s*,?\s*(\d{5}(?:-\d{4})?)"
+    # Already comma-separated street/city/state zip.
+    m1 = re.match(rf"^(.*?),\s*([A-Za-z][A-Za-z.\- ]{{1,40}}),\s*{state_zip}$", s)
+    if m1:
+        street, city, state_code, zip_code = m1.group(1), m1.group(2), m1.group(3), m1.group(4)
+        return f"{street.strip()}, {city.strip()}, {state_code.upper()}, {zip_code}"
+    # No-comma variant between street/city/state.
+    street_pat = (
+        r"(\d{1,6}\s+[A-Za-z0-9#.\- ]{2,45}"
+        r"(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Drive|Dr|Lane|Ln|Court|Ct|Way|Place|Pl|Circle|Cir|Highway|Hwy|Trail|Trl|Parkway|Pkwy|Terrace|Ter|Loop|Lp|Str)\.?"
+        r"(?:\s+(?:Apt|Apartment|Unit|Ste|Suite)\s*[A-Za-z0-9\-]+)?)"
+    )
+    m2 = re.match(rf"^{street_pat}\s+([A-Za-z][A-Za-z.\- ]{{1,40}})\s+{state_zip}$", s, re.I)
+    if m2:
+        street, city, state_code, zip_code = m2.group(1), m2.group(2), m2.group(3), m2.group(4)
+        return f"{street.strip()}, {city.strip()}, {state_code.upper()}, {zip_code}"
+    return s
+
+
+def _city_state_match(addr: str, city: str, state: str) -> bool:
+    addr_l = (addr or "").lower()
+    city_l = (city or "").strip().lower()
+    state_u = (state or "").strip().upper()
+    if city_l and city_l not in addr_l:
+        return False
+    if state_u and state_u in US_STATE_CODES and not re.search(rf"\b{re.escape(state_u)}\b", (addr or "").upper()):
+        return False
+    return True
+
+
+def _extract_deliverable_from_text(text: str, city: str = "", state: str = "") -> list[str]:
+    """Extract strict deliverable-looking addresses from noisy text blobs."""
+    if not text:
+        return []
+    t = re.sub(r"\s+", " ", text)
+    # Strict with commas, e.g. "123 Main St, Austin, TX 78701"
+    strict_comma = (
+        r"\b\d{1,6}\s+[A-Za-z0-9#.\- ]{2,45}"
+        r"(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Drive|Dr|Lane|Ln|Court|Ct|Way|Place|Pl|Circle|Cir|Highway|Hwy|Trail|Trl|Parkway|Pkwy|Terrace|Ter|Loop|Lp|Str)\.?"
+        r"(?:\s+(?:Apt|Apartment|Unit|Ste|Suite)\s*[A-Za-z0-9\-]+)?"
+        r"\s*,\s*[A-Za-z][A-Za-z.\- ]{1,40}\s*,\s*[A-Z]{2}\s+\d{5}(?:-\d{4})?\b"
+    )
+    # Relaxed no-comma, e.g. "231 Fort Bend Dr Missouri City TX 77459"
+    strict_no_comma = (
+        r"\b\d{1,6}\s+[A-Za-z0-9#.\- ]{2,45}"
+        r"(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Drive|Dr|Lane|Ln|Court|Ct|Way|Place|Pl|Circle|Cir|Highway|Hwy|Trail|Trl|Parkway|Pkwy|Terrace|Ter|Loop|Lp|Str)\.?"
+        r"(?:\s+(?:Apt|Apartment|Unit|Ste|Suite)\s*[A-Za-z0-9\-]+)?"
+        r"\s+[A-Za-z][A-Za-z.\- ]{1,40}\s+[A-Z]{2}\s+\d{5}(?:-\d{4})?\b"
+    )
+    raw = []
+    for pat in (strict_comma, strict_no_comma):
+        for m in re.finditer(pat, t, re.I):
+            raw.append(_trim_to_street_start(m.group(0)))
+    out: list[str] = []
+    seen = set()
+    for a in raw:
+        key = a.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        if not (has_street(a) and has_zip(a) and has_state_code(a)):
+            continue
+        if not _city_state_match(a, city, state):
+            continue
+        out.append(a)
+    return out
+
+
+def extract_zip_near_address(text: str, address: str, max_chars: int = 180) -> str:
+    """Try to find a nearby zip code for a partial address (bounded scan)."""
+    if not text or not address:
+        return ""
+    # Normalize light whitespace to improve index matching.
+    norm_text = re.sub(r"\s+", " ", text)
+    norm_addr = re.sub(r"\s+", " ", address).strip()
+    idx = norm_text.lower().find(norm_addr.lower())
+    if idx == -1:
+        return ""
+    start = max(0, idx - 40)
+    end = min(len(norm_text), idx + len(norm_addr) + max_chars)
+    window = norm_text[start:end]
+    m = re.search(r"\b\d{5}(?:-\d{4})?\b", window)
+    return m.group(0) if m else ""
+
+
+def score_address(addr: str) -> int:
+    """Score address completeness 0-5: street(2) + city(1) + state(1) + zip(1).
+    Higher score = more complete address."""
+    if not addr:
+        return 0
+    score = 0
+    addr_lower = addr.lower()
+    # Check for street number + street name (2 points)
+    if re.search(r"\d+\s+[a-z0-9\s.\-]+(?:street|st|avenue|ave|road|rd|boulevard|blvd|drive|dr|lane|ln|court|ct|way|place|pl|circle|cir)", addr_lower):
+        score += 2
+    # Check for city (1 point) - look for comma-separated city name
+    if re.search(r",\s*[a-z\s]+,\s*[a-z]{2}", addr_lower):
+        score += 1
+    # Check for state (1 point) - 2-letter state code
+    if re.search(r",\s*[a-z]{2}\s+", addr_lower):
+        score += 1
+    # Check for zip code (1 point) - 5 digits, optionally with -4
+    if re.search(r"\d{5}(?:-\d{4})?", addr):
+        score += 1
+    return score
+
+
 def extract_addresses(text: str) -> list[str]:
+    """Extract addresses, prioritizing those with zip codes."""
     if not text:
         return []
     found = []
+    # Pattern 1: Full address with zip code (PRIORITIZE THESE)
     full_re = r"\d+\s+[A-Za-z0-9\s.\-]+(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Drive|Dr|Lane|Ln|Court|Ct|Way|Place|Pl|Circle|Cir)[,.\s]+[A-Za-z\s]+,\s*[A-Z]{2}\s+\d{5}(?:-\d{4})?"
     for m in re.finditer(full_re, text, re.I):
         found.append(m.group(0).strip())
+    # Pattern 2: Street + City + State + Zip (alternative format)
     street_re = r"(\d+\s+[A-Za-z0-9\s.\-]+(?:St|Ave|Rd|Blvd|Dr|Ln|Ct)\.?)\s*[,]?\s*([A-Za-z\s]+),\s*([A-Z]{2})\s+(\d{5}(?:-\d{4})?)"
     for m in re.finditer(street_re, text, re.I):
         addr = f"{m.group(1).strip()}, {m.group(2).strip()}, {m.group(3)} {m.group(4)}"
         if addr not in found:
             found.append(addr)
+    # Pattern 3: Addresses without zip (lower priority, but still capture)
+    street_no_zip = r"\d+\s+[A-Za-z0-9\s.\-]+(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Drive|Dr|Lane|Ln|Court|Ct|Way|Place|Pl|Circle|Cir)[,.\s]+[A-Za-z\s]+,\s*[A-Z]{2}(?!\s+\d{5})"
+    for m in re.finditer(street_no_zip, text, re.I):
+        addr = m.group(0).strip()
+        if addr not in found:
+            found.append(addr)
+
+    # Pattern 4: Generic street format fallback (lowest priority, captures missed variants)
+    generic_re = r"\b\d{1,6}\s+[A-Za-z0-9.\- ]{2,80},\s*[A-Za-z.\- ]{2,40},\s*[A-Z]{2}(?:\s+\d{5}(?:-\d{4})?)?"
+    for m in re.finditer(generic_re, text, re.I):
+        addr = re.sub(r"\s+", " ", m.group(0)).strip(" ,.")
+        if addr and addr not in found:
+            found.append(addr)
+
+    # Sort by completeness score (highest first)
+    scored = [(addr, score_address(addr)) for addr in found]
+    scored.sort(key=lambda x: x[1], reverse=True)
+
     seen = set()
     out = []
-    for a in found:
-        if a not in seen:
-            seen.add(a)
-            out.append(a)
+    for addr, _ in scored:
+        addr_normalized = addr.lower().strip()
+        if addr_normalized not in seen:
+            seen.add(addr_normalized)
+            out.append(addr)
     return out
+
+
+def choose_best_address(candidates: list[str], text: str, city: str = "", state: str = "") -> str:
+    """Pick the best address using completeness score and bounded zip fallback."""
+    if not candidates:
+        return ""
+
+    city_lower = (city or "").strip().lower()
+    state_upper = (state or "").strip().upper()
+    unique: list[str] = []
+    seen = set()
+    for addr in candidates:
+        cleaned = _normalize_address_spaces(str(addr or ""))
+        if not cleaned:
+            continue
+        key = cleaned.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(cleaned)
+
+    scored: list[tuple[int, str]] = []
+    for addr in unique:
+        improved = addr
+        zip_added_from_fallback = False
+        if not has_zip(improved):
+            nearby_zip = extract_zip_near_address(text, improved)
+            if nearby_zip:
+                improved = f"{improved} {nearby_zip}"
+                zip_added_from_fallback = True
+
+        score = score_address(improved)
+        # Prefer addresses that already had zip over zip inferred from nearby text.
+        if zip_added_from_fallback:
+            score -= 1
+        # Small tie-breakers for explicit city/state match.
+        addr_lower = improved.lower()
+        if city_lower and city_lower in addr_lower:
+            score += 1
+        if state_upper and re.search(rf"\b{re.escape(state_upper)}\b", improved):
+            score += 1
+        scored.append((score, improved))
+
+    scored.sort(key=lambda item: (item[0], len(item[1])), reverse=True)
+    return scored[0][1] if scored else ""
 
 
 def extract_urls(text: str) -> list[str]:
@@ -129,14 +359,15 @@ def extract_urls(text: str) -> list[str]:
     return out
 
 
-def _extract_from_text(text: str, source_url: str = "") -> dict:
+def _extract_from_text(text: str, source_url: str = "", city: str = "", state: str = "") -> dict:
     """Extract address, phone, email, website from raw text."""
     addresses = extract_addresses(text)
     phones = extract_phones(text)
     emails = extract_emails(text)
     urls = extract_urls(text)
+    best_address = choose_best_address(addresses, text, city=city, state=state)
     return {
-        "address": addresses[0] if addresses else "",
+        "address": best_address,
         "phone": phones[0] if phones else "",
         "email": emails[0] if emails else "",
         "website": urls[0] if urls else "",
@@ -144,43 +375,42 @@ def _extract_from_text(text: str, source_url: str = "") -> dict:
     }
 
 
-# --- DuckDuckGo (Stage 1 - free) ---
-
-def duckduckgo_lookup(name: str, city: str, state: str) -> dict:
-    """Scrape DuckDuckGo HTML and extract contact info. No API key needed."""
-    parts = [p.strip() for p in [name, city, state] if p and p.strip()]
-    query = ", ".join(parts) + " address phone email"
-    url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    }
-
-    try:
-        r = requests.get(url, headers=headers, timeout=15)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-        text = soup.get_text(separator=" ")
-        # Try to get first result link as source
-        first_link = soup.select_one("a.result__a")
-        source_url = first_link.get("href", "") if first_link else ""
-        result = _extract_from_text(text, source_url)
-        result["ok"] = True
-        return result
-    except Exception as e:
-        return {"ok": False, "error": str(e), "address": "", "phone": "", "email": "", "website": "", "source_url": ""}
-
-
 # --- Serper (Stage 2 - uses API quota) ---
 
 def collect_serper_text(data: dict) -> str:
+    """Collect text from Serper results, prioritizing structured address data from places."""
     parts = []
+    answer_box = data.get("answerBox") or {}
+    for key in ("answer", "snippet", "title"):
+        if answer_box.get(key):
+            parts.append(str(answer_box[key]))
+    if answer_box.get("attributes"):
+        for v in answer_box["attributes"].values():
+            parts.append(str(v))
+
+    # PRIORITIZE: Check places array first for structured addresses (often has full address with zip)
+    for p in data.get("places") or []:
+        if p.get("address"):
+            # Places address is often structured and complete
+            parts.append(p["address"])
+        if p.get("phoneNumber"):
+            parts.append(str(p["phoneNumber"]))
+        if p.get("website"):
+            parts.append(str(p["website"]))
+        if p.get("name"):
+            parts.append(p["name"])
+        if p.get("snippet"):
+            parts.append(p["snippet"])
+    # Knowledge Graph may have address info
     kg = data.get("knowledgeGraph") or {}
+    if kg.get("title"):
+        parts.append(str(kg["title"]))
     if kg.get("description"):
         parts.append(kg["description"])
     if kg.get("attributes"):
         for v in kg["attributes"].values():
             parts.append(str(v))
+    # Organic results
     for item in data.get("organic") or []:
         if item.get("snippet"):
             parts.append(item["snippet"])
@@ -188,31 +418,21 @@ def collect_serper_text(data: dict) -> str:
             parts.append(item["title"])
         if item.get("link"):
             parts.append(item["link"])
+    # People Also Ask
     for item in data.get("peopleAlsoAsk") or []:
         if item.get("snippet"):
             parts.append(item["snippet"])
-    for p in data.get("places") or []:
-        if p.get("name"):
-            parts.append(p["name"])
-        if p.get("address"):
-            parts.append(p["address"])
-        if p.get("snippet"):
-            parts.append(p["snippet"])
+        if item.get("question"):
+            parts.append(item["question"])
     return " ".join(parts)
 
 
-def serper_lookup(name: str, city: str, state: str) -> dict:
-    """Call Serper API and extract address, phone, email from results."""
-    if not SERPER_API_KEY:
-        return {"ok": False, "error": "SERPER_API_KEY not set"}
-
-    parts = [p.strip() for p in [name, city, state] if p and p.strip()]
-    query = ", ".join(parts) + " address phone email"
-    payload = {"q": query, "num": 10}
-
+def _serper_search(query: str, num: int) -> tuple[bool, dict | str]:
+    """Execute one Serper search with retries."""
     last_err = None
     for attempt in range(MAX_RETRIES):
         try:
+            payload = {"q": query, "num": num}
             r = requests.post(
                 SERPER_ENDPOINT,
                 json=payload,
@@ -220,23 +440,113 @@ def serper_lookup(name: str, city: str, state: str) -> dict:
                 timeout=30,
             )
             if r.status_code == 200:
-                data = r.json()
-                text = collect_serper_text(data)
-                organic = data.get("organic") or []
-                source_url = organic[0]["link"] if organic and organic[0].get("link") else ""
-                result = _extract_from_text(text, source_url)
-                result["ok"] = True
-                return result
+                return True, r.json()
             if r.status_code in (429, 500, 502, 503):
                 last_err = r.text
                 time.sleep(REQUEST_DELAY * (2**attempt))
                 continue
-            return {"ok": False, "error": r.text[:500]}
+            return False, r.text[:500]
         except requests.RequestException as e:
             last_err = str(e)
             time.sleep(REQUEST_DELAY * (2**attempt))
+    return False, last_err or "Max retries exceeded"
 
-    return {"ok": False, "error": last_err or "Max retries exceeded"}
+
+def _extract_from_serper_payload(data: dict, city: str, state: str) -> dict:
+    """Parse one Serper payload into normalized enrichment result."""
+    places = data.get("places") or []
+    place_addresses: list[str] = []
+    place_phones: list[str] = []
+    place_websites: list[str] = []
+    for p in places:
+        if p.get("address"):
+            place_addresses.append(str(p["address"]).strip())
+        for phone_key in ("phoneNumber", "phone", "telephone"):
+            if p.get(phone_key):
+                place_phones.append(str(p[phone_key]).strip())
+        if p.get("website"):
+            place_websites.append(str(p["website"]).strip())
+
+    text = collect_serper_text(data)
+    organic = data.get("organic") or []
+    source_url = organic[0]["link"] if organic and organic[0].get("link") else ""
+    result = _extract_from_text(text, source_url, city=city, state=state)
+
+    # Compare structured addresses vs extracted text and keep best completeness.
+    candidate_addresses = list(place_addresses)
+    if result.get("address"):
+        candidate_addresses.append(result["address"])
+    if not has_zip(result.get("address", "")):
+        # Bounded fallback for zip recovery from surrounding text.
+        fallback_addresses = extract_addresses(text)[:3]
+        candidate_addresses.extend(fallback_addresses)
+    best_any = choose_best_address(candidate_addresses, text, city=city, state=state)
+    deliverable = _extract_deliverable_from_text(f"{' '.join(candidate_addresses)} {text}", city=city, state=state)
+    if not deliverable and state:
+        # Relaxed fallback: keep state constraint but allow city mismatch to recover more valid addresses.
+        deliverable = _extract_deliverable_from_text(f"{' '.join(candidate_addresses)} {text}", city="", state=state)
+    # Prefer strict deliverable extraction; if none, keep only clearly complete addresses.
+    if deliverable:
+        result["address"] = _format_address_output(choose_best_address(deliverable, text, city=city, state=state))
+    elif best_any and has_street(best_any) and has_zip(best_any) and _city_state_match(best_any, city, state):
+        result["address"] = _format_address_output(best_any)
+    else:
+        result["address"] = ""
+
+    if place_phones and not result.get("phone"):
+        result["phone"] = place_phones[0]
+    if place_websites and not result.get("website"):
+        result["website"] = place_websites[0]
+    if not result.get("source_url"):
+        result["source_url"] = result.get("website", "")
+    return result
+
+
+def _merge_results(primary: dict, fallback: dict, city: str, state: str) -> dict:
+    """Merge two Serper extraction results, preserving best address and missing contacts."""
+    merged = dict(primary)
+    merged["address"] = _format_address_output(choose_best_address(
+        [primary.get("address", ""), fallback.get("address", "")],
+        f"{primary.get('address', '')} {fallback.get('address', '')}",
+        city=city,
+        state=state,
+    ))
+    for field in ("phone", "email", "website", "source_url"):
+        if not merged.get(field) and fallback.get(field):
+            merged[field] = fallback[field]
+    return merged
+
+
+def serper_lookup(name: str, city: str, state: str) -> dict:
+    """Call Serper API and extract address, phone, email from results.
+    Address-first primary query with bounded contact fallback."""
+    if not SERPER_API_KEY:
+        return {"ok": False, "error": "SERPER_API_KEY not set"}
+
+    ok, data_or_error = _serper_search(build_address_query(name, city, state), SERPER_NUM_RESULTS)
+    if not ok:
+        return {"ok": False, "error": str(data_or_error)}
+    primary = _extract_from_serper_payload(data_or_error, city=city, state=state)
+
+    # Bounded fallback: one extra address query only when address is still missing.
+    if not primary.get("address"):
+        ok_addr, data_addr = _serper_search(
+            build_address_fallback_query(name, city, state), SERPER_ADDRESS_FALLBACK_NUM_RESULTS
+        )
+        if ok_addr:
+            secondary_addr = _extract_from_serper_payload(data_addr, city=city, state=state)
+            primary = _merge_results(primary, secondary_addr, city=city, state=state)
+
+    # Bounded fallback: one extra query only if contact fields are still missing.
+    if not primary.get("phone") or not primary.get("email"):
+        ok2, data_or_error2 = _serper_search(build_contact_query(name, city, state), SERPER_CONTACT_NUM_RESULTS)
+        if ok2:
+            secondary = _extract_from_serper_payload(data_or_error2, city=city, state=state)
+            primary = _merge_results(primary, secondary, city=city, state=state)
+
+    primary["address"] = _format_address_output(primary.get("address", ""))
+    primary["ok"] = True
+    return primary
 
 
 # --- CSV helpers ---
@@ -274,10 +584,8 @@ def run_enrichment_job(job_id: str, payload: dict) -> None:
     name_col = payload.get("nameCol")
     first_col = payload.get("firstNameCol")
     last_col = payload.get("lastNameCol")
-    mode = payload.get("mode", "duck_then_serper")  # duck_then_serper | serper_only | duck_only
-
     with jobs_lock:
-        jobs[job_id] = {"status": "running", "current": 0, "total": 0, "stage": "duckduckgo", "enriched": 0}
+        jobs[job_id] = {"status": "running", "current": 0, "total": 0, "stage": "serper", "enriched": 0}
 
     try:
         headers, rows = parse_csv_content(content)
@@ -304,32 +612,11 @@ def run_enrichment_job(job_id: str, payload: dict) -> None:
             city = get_row_value(row, headers, city_col)
             state = get_row_value(row, headers, state_col)
 
-            result = None
-
-            if mode == "serper_only":
-                with jobs_lock:
-                    jobs[job_id]["current"] = i + 1
-                    jobs[job_id]["stage"] = "serper"
-                result = serper_lookup(name, city, state)
-                time.sleep(REQUEST_DELAY)
-            else:
-                with jobs_lock:
-                    jobs[job_id]["current"] = i + 1
-                    jobs[job_id]["stage"] = "duckduckgo"
-                result = duckduckgo_lookup(name, city, state)
-                time.sleep(DUCK_DELAY)
-
-                # Treat DuckDuckGo garbage (error-lite@duckduckgo.com, redirect URLs) as empty
-                result = clear_duck_garbage(result)
-
-                # Stage 2: Serper fallback if DuckDuckGo didn't find real data (and we have API key)
-                if mode == "duck_then_serper" and (
-                    not result.get("address") and not result.get("phone") and not result.get("email")
-                ) and SERPER_API_KEY:
-                    with jobs_lock:
-                        jobs[job_id]["stage"] = "serper"
-                    result = serper_lookup(name, city, state)
-                    time.sleep(REQUEST_DELAY)
+            with jobs_lock:
+                jobs[job_id]["current"] = i + 1
+                jobs[job_id]["stage"] = "serper"
+            result = serper_lookup(name, city, state)
+            time.sleep(REQUEST_DELAY)
 
             if result.get("ok"):
                 addr = result.get("address", "")
@@ -409,9 +696,8 @@ def api_enrich_start():
     if not state_col or state_col not in headers:
         return jsonify({"error": "State column not found"}), 400
 
-    mode = data.get("mode", "duck_then_serper")
-    if mode == "serper_only" and not SERPER_API_KEY:
-        return jsonify({"error": "Serper-only mode requires SERPER_API_KEY in .env"}), 400
+    if not SERPER_API_KEY:
+        return jsonify({"error": "SERPER_API_KEY is required in .env"}), 400
 
     job_id = str(uuid.uuid4())
     thread = threading.Thread(target=run_enrichment_job, args=(job_id, data))

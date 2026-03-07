@@ -16,7 +16,6 @@ const lastNameCol = document.getElementById('lastNameCol');
 const cityCol = document.getElementById('cityCol');
 const stateCol = document.getElementById('stateCol');
 const limitSelect = document.getElementById('limit');
-const enrichModeSelect = document.getElementById('enrichMode');
 const rowCountEl = document.getElementById('rowCount');
 
 const enrichBtn = document.getElementById('enrichBtn');
@@ -175,7 +174,6 @@ enrichBtn.addEventListener('click', async () => {
     cityCol: cityCol.value,
     stateCol: stateCol.value,
     limit,
-    mode: enrichModeSelect.value,
   };
   if (nameModeFirstLast.checked) {
     payload.firstNameCol = firstNameCol.value;
@@ -203,7 +201,7 @@ enrichBtn.addEventListener('click', async () => {
             const status = await statusRes.json();
             if (!statusRes.ok) return reject(new Error(status.error || 'Status check failed'));
 
-            const { current = 0, total = 0, stage = 'duckduckgo', status: jobStatus } = status;
+            const { current = 0, total = 0, stage = 'serper', status: jobStatus } = status;
             const pct = total > 0 ? Math.round((current / total) * 100) : 0;
             if (progressBar) progressBar.style.width = `${pct}%`;
             if (progressDetail) progressDetail.textContent = `${current} / ${total} rows`;
